@@ -420,3 +420,123 @@ func TestSandboxReloadVolumes(t *testing.T) {
 
 	g.Expect(mock.AssertExhausted()).ShouldNot(gomega.HaveOccurred())
 }
+
+func TestVolumeFromID(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+	ctx := t.Context()
+
+	mock := newGRPCMockClient(t)
+
+	grpcmock.HandleUnary(mock, "/VolumeGetById",
+		func(req *pb.VolumeGetByIdRequest) (*pb.VolumeGetByIdResponse, error) {
+			g.Expect(req.GetVolumeId()).To(gomega.Equal("vo-abc"))
+			return pb.VolumeGetByIdResponse_builder{
+				VolumeId: "vo-abc",
+				Metadata: pb.VolumeMetadata_builder{Name: "my-vol"}.Build(),
+			}.Build(), nil
+		},
+	)
+
+	vol, err := mock.Volumes.FromID(ctx, "vo-abc", nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	g.Expect(vol.VolumeID).To(gomega.Equal("vo-abc"))
+	g.Expect(vol.Name).To(gomega.Equal("my-vol"))
+
+	g.Expect(mock.AssertExhausted()).ShouldNot(gomega.HaveOccurred())
+}
+
+func TestVolumeFromIDNotFound(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+	ctx := t.Context()
+
+	mock := newGRPCMockClient(t)
+
+	grpcmock.HandleUnary(mock, "/VolumeGetById",
+		func(req *pb.VolumeGetByIdRequest) (*pb.VolumeGetByIdResponse, error) {
+			return nil, status.Errorf(codes.NotFound, "not found")
+		},
+	)
+
+	_, err := mock.Volumes.FromID(ctx, "vo-missing", nil)
+	g.Expect(err).Should(gomega.BeAssignableToTypeOf(modal.NotFoundError{}))
+
+	g.Expect(mock.AssertExhausted()).ShouldNot(gomega.HaveOccurred())
+}
+
+func TestVolumeInfo(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+	ctx := t.Context()
+
+	mock := newGRPCMockClient(t)
+
+	grpcmock.HandleUnary(mock, "/VolumeGetOrCreate",
+		func(req *pb.VolumeGetOrCreateRequest) (*pb.VolumeGetOrCreateResponse, error) {
+			return pb.VolumeGetOrCreateResponse_builder{VolumeId: "vo-info"}.Build(), nil
+		},
+	)
+	grpcmock.HandleUnary(mock, "/VolumeGetById",
+		func(req *pb.VolumeGetByIdRequest) (*pb.VolumeGetByIdResponse, error) {
+			g.Expect(req.GetVolumeId()).To(gomega.Equal("vo-info"))
+			return pb.VolumeGetByIdResponse_builder{
+				VolumeId: "vo-info",
+				Metadata: pb.VolumeMetadata_builder{
+					Name:    "info-vol",
+					Version: pb.VolumeFsVersion_VOLUME_FS_VERSION_V2,
+					CreationInfo: pb.CreationInfo_builder{
+						CreatedAt: 1700000000,
+						CreatedBy: "tester",
+					}.Build(),
+				}.Build(),
+			}.Build(), nil
+		},
+	)
+
+	vol, err := mock.Volumes.FromName(ctx, "info-vol", &modal.VolumeFromNameParams{CreateIfMissing: true})
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	info, err := vol.Info(ctx, nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	g.Expect(info.Name).To(gomega.Equal("info-vol"))
+	g.Expect(info.Version).To(gomega.Equal(pb.VolumeFsVersion_VOLUME_FS_VERSION_V2))
+	g.Expect(info.CreatedAt).To(gomega.Equal(float64(1700000000)))
+	g.Expect(info.CreatedBy).To(gomega.Equal("tester"))
+
+	g.Expect(mock.AssertExhausted()).ShouldNot(gomega.HaveOccurred())
+}
+
+func TestVolumePutFileNoMissingBlocks(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+	ctx := t.Context()
+
+	mock := newGRPCMockClient(t)
+
+	grpcmock.HandleUnary(mock, "/VolumeGetOrCreate",
+		func(req *pb.VolumeGetOrCreateRequest) (*pb.VolumeGetOrCreateResponse, error) {
+			return pb.VolumeGetOrCreateResponse_builder{VolumeId: "vo-put"}.Build(), nil
+		},
+	)
+	grpcmock.HandleUnary(mock, "/VolumePutFiles2",
+		func(req *pb.VolumePutFiles2Request) (*pb.VolumePutFiles2Response, error) {
+			g.Expect(req.GetVolumeId()).To(gomega.Equal("vo-put"))
+			g.Expect(req.GetDisallowOverwriteExistingFiles()).To(gomega.BeTrue())
+			g.Expect(req.GetFiles()).To(gomega.HaveLen(1))
+			f := req.GetFiles()[0]
+			g.Expect(f.GetPath()).To(gomega.Equal("/a.txt"))
+			g.Expect(f.GetSize()).To(gomega.Equal(uint64(5)))
+			g.Expect(f.GetBlocks()).To(gomega.HaveLen(1))
+			g.Expect(f.GetBlocks()[0].GetContentsSha256()).To(gomega.HaveLen(32))
+			// No missing blocks -> the put completes without any HTTP upload.
+			return pb.VolumePutFiles2Response_builder{}.Build(), nil
+		},
+	)
+
+	vol, err := mock.Volumes.FromName(ctx, "put-vol", &modal.VolumeFromNameParams{CreateIfMissing: true})
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+	err = vol.PutFile(ctx, "/a.txt", []byte("hello"), nil)
+	g.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+	g.Expect(mock.AssertExhausted()).ShouldNot(gomega.HaveOccurred())
+}

@@ -8,10 +8,9 @@ import (
 	modal "github.com/modal-labs/modal-client/go"
 )
 
-// This example demonstrates the Volume file-management API: listing, reading,
-// copying, and removing files directly from the client, plus committing and
-// reloading a Volume. Files are first written by mounting the Volume in a
-// Sandbox, then inspected from the client without a Sandbox.
+// This example demonstrates reading and writing Volume files directly from the
+// client — no Sandbox required. These APIs require a v2 Volume, which is the SDK
+// default when Version is left unspecified.
 func main() {
 	ctx := context.Background()
 	mc, err := modal.NewClient()
@@ -19,43 +18,30 @@ func main() {
 		log.Fatalf("Failed to create client: %v", err)
 	}
 
-	app, err := mc.Apps.FromName(ctx, "libmodal-example", &modal.AppFromNameParams{CreateIfMissing: true})
-	if err != nil {
-		log.Fatalf("Failed to get or create App: %v", err)
-	}
-
-	image := mc.Images.FromRegistry("alpine:3.21", nil)
-
-	// The file-management RPCs (ListDir, ReadFile, CopyFiles, ...) require a v2
-	// Volume, which is the SDK default when Version is left unspecified.
-	volume, err := mc.Volumes.FromName(ctx, "libmodal-example-volume-files-v2", &modal.VolumeFromNameParams{
+	volume, err := mc.Volumes.FromName(ctx, "libmodal-volume-files-example", &modal.VolumeFromNameParams{
 		CreateIfMissing: true,
 	})
 	if err != nil {
 		log.Fatalf("Failed to create Volume: %v", err)
 	}
 
-	// Write some files into the Volume by mounting it in a Sandbox.
-	writer, err := mc.Sandboxes.Create(ctx, app, image, &modal.SandboxCreateParams{
-		Command: []string{
-			"sh", "-c",
-			"mkdir -p /mnt/volume/data && " +
-				"echo 'hello from modal' > /mnt/volume/data/message.txt && " +
-				"echo 'second file' > /mnt/volume/data/other.txt",
-		},
-		Volumes: map[string]*modal.Volume{"/mnt/volume": volume},
-	})
+	info, err := volume.Info(ctx, nil)
 	if err != nil {
-		log.Fatalf("Failed to create writer Sandbox: %v", err)
+		log.Fatalf("Failed to get Volume info: %v", err)
 	}
-	if _, err := writer.Wait(ctx, nil); err != nil {
-		log.Fatalf("Failed to wait for writer Sandbox: %v", err)
-	}
-	if _, err := writer.Terminate(context.Background(), nil); err != nil {
-		log.Fatalf("Failed to terminate writer Sandbox: %v", err)
-	}
+	fmt.Printf("Volume %q (version %v)\n", info.Name, info.Version)
 
-	// List the directory contents from the client.
+	// Write files directly to the Volume (overwrite if they already exist).
+	force := &modal.VolumePutFileParams{Force: true}
+	if err := volume.PutFile(ctx, "/data/message.txt", []byte("hello from modal\n"), force); err != nil {
+		log.Fatalf("Failed to write Volume file: %v", err)
+	}
+	if err := volume.PutFile(ctx, "/data/other.txt", []byte("second file\n"), force); err != nil {
+		log.Fatalf("Failed to write Volume file: %v", err)
+	}
+	fmt.Println("Wrote /data/message.txt and /data/other.txt")
+
+	// List the directory contents.
 	entries, err := volume.ListDir(ctx, "/data", &modal.VolumeListDirParams{Recursive: true})
 	if err != nil {
 		log.Fatalf("Failed to list Volume directory: %v", err)
@@ -83,10 +69,6 @@ func main() {
 		log.Fatalf("Failed to remove Volume file: %v", err)
 	}
 	fmt.Println("Removed other.txt")
-
-	// Note: Volume.Commit and Volume.Reload operate on a Volume mounted inside a
-	// running container (e.g. from a Sandbox after writing files), not from the
-	// client control plane, so they are not demonstrated here.
 
 	fmt.Println("Done.")
 }

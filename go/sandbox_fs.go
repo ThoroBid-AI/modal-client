@@ -1,9 +1,11 @@
 package modal
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"io"
+	"iter"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -97,6 +99,33 @@ type SandboxFilesystemStatParams struct{}
 
 // SandboxFilesystemWriteParams holds optional parameters for [SandboxFilesystem.WriteBytes] and [SandboxFilesystem.WriteText].
 type SandboxFilesystemWriteParams struct{}
+
+// SandboxFileWatchEventType represents the type of a filesystem watch event.
+type SandboxFileWatchEventType string
+
+const (
+	SandboxFileWatchEventTypeUnknown SandboxFileWatchEventType = "Unknown"
+	SandboxFileWatchEventTypeAccess  SandboxFileWatchEventType = "Access"
+	SandboxFileWatchEventTypeCreate  SandboxFileWatchEventType = "Create"
+	SandboxFileWatchEventTypeModify  SandboxFileWatchEventType = "Modify"
+	SandboxFileWatchEventTypeRemove  SandboxFileWatchEventType = "Remove"
+)
+
+// SandboxFileWatchEvent represents a single filesystem change reported by [SandboxFilesystem.Watch].
+type SandboxFileWatchEvent struct {
+	Paths []string
+	Type  SandboxFileWatchEventType
+}
+
+// SandboxFilesystemWatchParams holds optional parameters for [SandboxFilesystem.Watch].
+type SandboxFilesystemWatchParams struct {
+	// Recursive controls whether subdirectories are watched. Defaults to false.
+	Recursive bool
+	// Filter restricts which event types are reported. Nil (the default) reports all events.
+	Filter []SandboxFileWatchEventType
+	// Timeout, in seconds, after which the watch stops. Nil (the default) watches indefinitely.
+	Timeout *int
+}
 
 // CopyFromLocal copies a local file into the Sandbox.
 //
@@ -547,4 +576,99 @@ func (fsys *SandboxFilesystem) WriteText(ctx context.Context, data string, remot
 		return err
 	}
 	return fsys.writeFile(ctx, "WriteText", []byte(data), remotePath, params)
+}
+
+// Watch watches a path in the Sandbox for filesystem changes, returning an
+// iterator that yields a [SandboxFileWatchEvent] for each change until the
+// watch ends (when params.Timeout elapses), ctx is cancelled, or the consumer
+// stops iterating.
+//
+// remotePath must be an absolute path in the Sandbox.
+//
+// Rename events are reported as [SandboxFileWatchEventTypeModify]. Returns
+// [SandboxFilesystemNotFoundError] if remotePath does not exist or
+// [SandboxFilesystemPermissionError] if read permission is denied.
+func (fsys *SandboxFilesystem) Watch(ctx context.Context, remotePath string, params *SandboxFilesystemWatchParams) iter.Seq2[SandboxFileWatchEvent, error] {
+	if params == nil {
+		params = &SandboxFilesystemWatchParams{}
+	}
+
+	var filter []string
+	if params.Filter != nil {
+		filter = make([]string, 0, len(params.Filter))
+		for _, f := range params.Filter {
+			filter = append(filter, string(f))
+			// Modify covers the fs-tools binary's Rename/RenameFrom/RenameTo
+			// variants, so include them when filtering for Modify events.
+			if f == SandboxFileWatchEventTypeModify {
+				filter = append(filter, "Rename", "RenameFrom", "RenameTo")
+			}
+		}
+	}
+	command := makeWatchCommand(remotePath, params.Recursive, filter, params.Timeout)
+
+	return func(yield func(SandboxFileWatchEvent, error) bool) {
+		if err := validateAbsoluteRemotePath(remotePath, "Watch"); err != nil {
+			yield(SandboxFileWatchEvent{}, err)
+			return
+		}
+
+		cp, err := fsys.sandbox.execForFilesystem(ctx, []string{sandboxFsToolsPath, command}, nil)
+		if err != nil {
+			yield(SandboxFileWatchEvent{}, translateExecError(ctx, fsys.logger, "Watch", remotePath, err))
+			return
+		}
+
+		// Drain stderr concurrently so a chatty error stream can't deadlock the process.
+		stderrCh := make(chan []byte, 1)
+		go func() {
+			data, _ := io.ReadAll(cp.Stderr)
+			stderrCh <- data
+		}()
+
+		scanner := bufio.NewScanner(cp.Stdout)
+		scanner.Buffer(make([]byte, 0, 64*1024), taskCommandRouterMaxBufferSize)
+		for scanner.Scan() {
+			line := scanner.Bytes()
+			if len(line) == 0 {
+				continue
+			}
+			var raw struct {
+				Paths     []string `json:"paths"`
+				EventType string   `json:"event_type"`
+			}
+			if err := json.Unmarshal(line, &raw); err != nil {
+				// Skip malformed lines rather than aborting the whole watch.
+				continue
+			}
+			if len(raw.Paths) == 0 {
+				continue
+			}
+
+			eventType := SandboxFileWatchEventType(raw.EventType)
+			// Collapse the fs-tools binary's rename variants to a single Modify event.
+			switch raw.EventType {
+			case "Rename", "RenameFrom", "RenameTo":
+				eventType = SandboxFileWatchEventTypeModify
+			}
+
+			if !yield(SandboxFileWatchEvent{Paths: raw.Paths, Type: eventType}, nil) {
+				return
+			}
+		}
+		if err := scanner.Err(); err != nil {
+			yield(SandboxFileWatchEvent{}, translateExecError(ctx, fsys.logger, "Watch", remotePath, err))
+			return
+		}
+
+		stderrData := <-stderrCh
+		returnCode, err := cp.Wait(ctx, nil)
+		if err != nil {
+			yield(SandboxFileWatchEvent{}, translateExecError(ctx, fsys.logger, "Watch", remotePath, err))
+			return
+		}
+		if returnCode != 0 {
+			yield(SandboxFileWatchEvent{}, raiseWatchError(ctx, fsys.logger, returnCode, stderrData, remotePath))
+		}
+	}
 }
